@@ -33,3 +33,8 @@
 
 # VSCODE
 .vscode/
+
+# VAGrant
+.vagrant/
+
+
