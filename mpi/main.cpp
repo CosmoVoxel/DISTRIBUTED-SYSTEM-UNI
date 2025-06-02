@@ -1,6 +1,4 @@
 #include <iostream>
-#include <iomanip>
-#include <sstream>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -23,37 +21,21 @@ typedef enum {
     DIR_RIGHT = 2
 } Direction;
 
-// Logger
 class Logger {
-private:
-    std::chrono::steady_clock::time_point start_time;
-    
+    std::chrono::steady_clock::time_point start_time{std::chrono::steady_clock::now()};
 public:
-    Logger() {
-        start_time = std::chrono::steady_clock::now();
+    std::string getCurrentTimestamp() const {
+        using namespace std::chrono;
+        auto ms = duration_cast<milliseconds>(steady_clock::now() - start_time).count();
+        auto min = ms / 60000 % 60;
+        auto sec = ms / 1000 % 60;
+        auto milli = ms % 1000;
+        return std::format("{:02}:{:02}:{:03}", min, sec, milli);
     }
-    
-    std::string getCurrentTimestamp() {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
-        
-        int total_ms = elapsed.count();
-        int minutes = (total_ms / 60000) % 60;
-        int seconds = (total_ms / 1000) % 60;
-        int milliseconds = total_ms % 1000;
-        
-        std::ostringstream oss;
-        oss << std::setfill('0') << std::setw(2) << minutes << ":"
-            << std::setfill('0') << std::setw(2) << seconds << ":"
-            << std::setfill('0') << std::setw(3) << milliseconds;
-        return oss.str();
+    void log(std::string_view state, std::string_view message) const {
+        std::cout << std::format("[{}][Process {}][{}] {}\n", getCurrentTimestamp(), rank, state, message);
     }
-    
-    void log(const std::string& state, const std::string& message) {
-        std::cout << "[" << getCurrentTimestamp() << "][Process " << rank << "][" << state << "] " << message << std::endl;
-    }
-    
-    std::string directionToString(Direction dir) {
+    static constexpr std::string_view directionToString(Direction dir) {
         switch(dir) {
             case DIR_LEFT: return "Left";
             case DIR_RIGHT: return "Right";
@@ -72,11 +54,11 @@ typedef struct {
 
 } Request;
 
-Request my_request;
+Request start_state;
 Request request_queue[100];
 int queue_size = 0;
 
-Direction current_direction = NONE; //
+Direction gate_direction = NONE; 
 
 void update_clock(int other) {
     if (other > lamport_clock)
@@ -121,12 +103,12 @@ void remove_request(int from_rank) {
 
 int count_top_n_same_direction() {
     // CURRENTLY IN INITIAL STATE
-    if (current_direction == NONE)
+    if (gate_direction == NONE)
         return 0;
 
     int count = 0;
     for (int i = 0; i < queue_size && count < GATE_CAPACITY; i++) {
-        if (request_queue[i].direction == current_direction)
+        if (request_queue[i].direction == gate_direction)
             count++;
         else
             break;
@@ -136,12 +118,12 @@ int count_top_n_same_direction() {
 
 int is_among_top_n(int rank_to_check) {
     // CURRENTLY IN INITIAL STATE
-    if (current_direction == NONE)
+    if (gate_direction == NONE)
         return 0;
 
     int count = 0;
     for (int i = 0; i < queue_size; i++) {
-        if (request_queue[i].direction == current_direction) {
+        if (request_queue[i].direction == gate_direction) {
             if (request_queue[i].rank == rank_to_check)
                 return count < GATE_CAPACITY;
             count++;
@@ -153,8 +135,8 @@ int is_among_top_n(int rank_to_check) {
 void try_change_direction() {
     // INIT STATE    
     if (queue_size == 0) {
-        if (current_direction != NONE) {
-            current_direction = NONE;
+        if (gate_direction != NONE) {
+            gate_direction = NONE;
         }
         return;
     }
@@ -163,29 +145,28 @@ void try_change_direction() {
     Direction top_dir = request_queue[0].direction;
 
     // NOT SET YET
-    if (current_direction == NONE) {
-        current_direction = top_dir;
-        logger.log("DIRECTION", "Gate direction set to " + logger.directionToString(static_cast<Direction>(current_direction)));
+    if (gate_direction == NONE) {
+        gate_direction = top_dir;
+        logger.log("DIRECTION", std::format("Gate direction set to {}", logger.directionToString(gate_direction)));
         return;
     }
 
-    // 
-    if (top_dir != current_direction) {
-        current_direction = top_dir;
-        logger.log("DIRECTION", "Gate direction changed to " + logger.directionToString(static_cast<Direction>(current_direction)));
+    if (top_dir != gate_direction) {
+        gate_direction = top_dir;
+        logger.log("DIRECTION", std::format("Gate direction changed to {}", logger.directionToString(gate_direction)));
     }
 }
 
 int can_enter() {
-    if (current_direction == NONE)
+    if (gate_direction == NONE)
         return 0;
 
 
-    if (queue_size == 0 || current_direction != request_queue[0].direction)
+    if (queue_size == 0 || gate_direction != request_queue[0].direction)
         return 0;
 
     
-    if (my_request.direction != current_direction)
+    if (start_state.direction != gate_direction)
         return 0;
 
     if (!is_among_top_n(rank))
@@ -199,12 +180,12 @@ int can_enter() {
 
 void send_request_to_all() {
     lamport_clock++;
-    my_request.timestamp = lamport_clock;
-    my_request.rank = rank;
+    start_state.timestamp = lamport_clock;
+    start_state.rank = rank;
 
     for (int i = 0; i < size; i++) {
         if (i == rank) continue;
-        int data[3] = {my_request.timestamp, rank, my_request.direction};
+        int data[3] = {start_state.timestamp, rank, start_state.direction};
         MPI_Send(&data, 3, MPI_INT, i, REQUEST, MPI_COMM_WORLD);
     }
 }
@@ -232,11 +213,11 @@ void enter_critical_section() {
         MPI_Send(&data, 2, MPI_INT, i, 100, MPI_COMM_WORLD);
     }
     
-    logger.log("ENTERING", "Gate direction " + logger.directionToString(static_cast<Direction>(current_direction)) + " at Lamport " + std::to_string(lamport_clock));
+    logger.log("ENTERING", std::format("Gate direction {} at Lamport {}", logger.directionToString(gate_direction), lamport_clock));
 
-    sleep(2);  
+    sleep(rand() % 3);
 
-    logger.log("LEAVING", "Gate at Lamport " + std::to_string(lamport_clock));
+    logger.log("LEAVING", std::format("Gate at Lamport {}", lamport_clock));
 }
 
 int main(int argc, char **argv) {
@@ -245,13 +226,13 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     // Half go left (DIR_LEFT=1), half go right (DIR_RIGHT=2)
-    my_request.direction = (rank % 2 == 0) ? DIR_LEFT : DIR_RIGHT;
+    start_state.direction = (rank % 2 == 0) ? DIR_LEFT : DIR_RIGHT;
     
     srand(rank + time(NULL));
     sleep(rand() % 3);
 
     send_request_to_all();
-    add_request(my_request);
+    add_request(start_state);
 
     MPI_Status status;
 
@@ -265,15 +246,15 @@ int main(int argc, char **argv) {
         if (status.MPI_TAG == REQUEST) {
             Request req = {buffer[0], buffer[1], static_cast<Direction>(buffer[2])};
             add_request(req);
-
             send_ack(buffer[1]);
+            try_change_direction();
 
         } else if (status.MPI_TAG == ACK) {
             ack_count++;
         } else if (status.MPI_TAG == RELEASE) {
             int releasing_rank = status.MPI_SOURCE;
             remove_request(releasing_rank);
-
+            try_change_direction();
         }
 
         // TRY
@@ -287,7 +268,6 @@ int main(int argc, char **argv) {
             break;
         }
 
-        try_change_direction();
 
     }
 
